@@ -10,6 +10,7 @@ const userSchema = new Schema({
         lowercase: true,
         trim: true,
         index: true,
+        minLength: [5,"min 5 characters"],
     },
     email: {
         type: String,
@@ -30,7 +31,6 @@ const userSchema = new Schema({
     },
     coverImage: {
         type: String,
-        required: true,
     },
     watchHistory: [
         {
