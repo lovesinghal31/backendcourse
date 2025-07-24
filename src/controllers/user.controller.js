@@ -6,6 +6,8 @@ import { ApiResponse } from "../utils/ApiResponse.js"
 import fs from "fs"
 import jwt from 'jsonwebtoken'
 import mongoose from "mongoose"
+import {otpStore} from "../utils/otpStore.js"
+import sendEmail from "../utils/sendEmail.js"
 
 
 const generateAccessAndRefreshTokens = async (userId) => {
@@ -25,20 +27,12 @@ const generateAccessAndRefreshTokens = async (userId) => {
 
 
 const registerUser = asyncHandler(async (req,res) => {
-    // get user details from frontend
-    // validation - not empty
-    // check if user already exist: username,email
-    // check for images, check for avatar
-    // upload them to cloudinary, avatar
-    // create user object - create entry in db
-    // remove passoword and refresh token field from response
-    // check for user creation
-    // return response
     const {fullName, email, username, password} = req.body
-    // console.log(`fullName: ${fullName}\nemail: ${email}\nusername: ${username}\npassword: ${password}`);
     if([fullName,email,username,password].some((field)=> field?.trim() === "")){
         throw new ApiError(400,"All field is required")
     }
+
+
     const exitedUser = await User.findOne({$or: [{username}, {email}]})
     if(exitedUser){
         // cleaning the temp folder when this error shows
@@ -60,49 +54,111 @@ const registerUser = asyncHandler(async (req,res) => {
         // ---------END HERE-----------
         throw new ApiError(409,"User with email or username already exist")
     }
-    // const avatarLocalPath = req.files?.avatar[0]?.path;
+
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = Date.now() + 10 * 60 * 1000;
+    otpStore.set(email, {
+        otp, 
+        userData: {
+            fullName, 
+            email, 
+            username, 
+            password,
+            files: req.files
+        }, 
+        expiresAt
+    });
+
+    await sendEmail({
+        to: email,
+        subject: "Chai - OTP for registration",
+        html: `<p>Your OTP for registration is <strong>${otp}</strong>. It is valid for 10 minutes.</p>`
+    });
+
+    console.log("OTP sent to email:", email);
+    
+    return res
+    .status(200)
+    .json(
+        new ApiResponse(
+            200,
+            {}, 
+            "OTP sent to your email. Please verify to complete registration."
+        )
+    )
+})
+
+const verifyRegistrationOtp = asyncHandler(async (req, res) => {
+    const {email, submittedOtp} = req.body;
+    if(!email || !submittedOtp) {
+        throw new ApiError(400, "Email and OTP are required");
+    }
+
+    const record = otpStore.get(email);
+    if(!record) {
+        throw new ApiError(404, "No OTP found for this email");
+    }
+
+    if(Date.now() > record.expiresAt) {
+        otpStore.delete(email);
+        throw new ApiError(410, "OTP has expired");
+    }
+
+    if(record.otp !== submittedOtp) {
+        throw new ApiError(400, "Invalid OTP");
+    }
+
+    const {fullName, username, password, files} = record.userData;
+
     let avatarLocalPath;
-    if(req.files && Array.isArray(req.files.avatar) && req.files.avatar.length > 0){
-        avatarLocalPath = req.files.avatar[0].path;
+    if(files && Array.isArray(files.avatar) && files.avatar.length > 0){
+        avatarLocalPath = files.avatar[0].path;
     }
     // const coverImageLocalPath = req.files?.coverImage[0]?.path;
     let coverImageLocalPath;
-    if(req.files && Array.isArray(req.files.coverImage) && req.files.coverImage.length > 0){
-        coverImageLocalPath = req.files.coverImage[0].path;
+    if(files && Array.isArray(files.coverImage) && files.coverImage.length > 0){
+        coverImageLocalPath = files.coverImage[0].path;
     }
     // console.log("req.files : ",req.files); // req. files
     if(!avatarLocalPath){
-        fs.unlinkSync(coverImageLocalPath)
         throw new ApiError(400,"Avatar file is required");
     }
     const avatar = await uploadOnCloudinary(avatarLocalPath);
     const coverImage = await uploadOnCloudinary(coverImageLocalPath)
+
     if(!avatar){
         throw new ApiError(400,"Avatar file upload failed");
     }
+
     const user = await User.create({
         fullName,
         avatar: avatar.url,
         coverImage: coverImage?.url || "",
         email,
         password,
-        username: username,
+        username,
     })
     const createdUser = await User.findById(user._id).select("-password -refreshToken")
     if(!createdUser){
         throw new ApiError(500,"Something went wrong while registering the user")
     }
+
+    otpStore.delete(email); // Clear OTP after successful registration
     console.log("user registered!!!")
-    return res.status(201).json(new ApiResponse(200,createdUser,"User registerd successfully"))
-})
+
+    return res
+    .status(201)
+    .json(
+        new ApiResponse(
+            201,
+            createdUser,
+            "User registered successfully. Please login to continue."
+        )
+    )
+});
 
 const loginUser = asyncHandler(async (req,res) => {
-    // req.body -> data
-    // username or email (empty or not)
-    // username or email based search in db for user
-    // check if password matches or not
-    // gen access and refresh token
-    // send cookies
     const {email,username,password} = req.body
     if(!(email || username)){
         throw new ApiError(400,"username or password required")
@@ -119,25 +175,74 @@ const loginUser = asyncHandler(async (req,res) => {
         throw new ApiError(401,"Invalid user credentials")
     }
 
-    const {accessToken,refreshToken} = await generateAccessAndRefreshTokens(user._id)
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = Date.now() + 10 * 60 * 1000;
+    otpStore.set(user.email, {otp, userId: user._id, expiresAt});
+    
+    await sendEmail({
+        to: user.email,
+        subject: "Chai - OTP for login",
+        html: `<p>Your OTP for login is <strong>${otp}</strong>. It is valid for 10 minutes.</p>`
+    });
 
-    const loggedInUser = await User.findById(user._id).select("-password -refreshToken")
+    console.log("OTP sent to email:", user.email);
 
-    const options = {httpOnly: true,secure: true}
-
-    console.log("user logged in")
     return res
     .status(200)
-    .cookie("accessToken",accessToken,options)
-    .cookie("refreshToken",refreshToken,options)
     .json(
         new ApiResponse(
             200,
-            {user: loggedInUser,accessToken,refreshToken},
-            "user logged in successfully"
+            {},
+            "OTP sent to your email. Please verify to login.",
         )
     )
 })
+
+const verifyLoginOtp = asyncHandler(async (req, res) => {
+    const {email, submittedOtp} = req.body;
+    if(!email || !submittedOtp) {
+        throw new ApiError(400, "Email and OTP are required");
+    }
+
+    const record = otpStore.get(email);
+    if(!record) {
+        throw new ApiError(404, "No OTP found for this email");
+    }
+
+    if(Date.now() > record.expiresAt) {
+        otpStore.delete(email);
+        throw new ApiError(410, "OTP has expired");
+    }
+
+    if(record.otp !== submittedOtp) {
+        throw new ApiError(400, "Invalid OTP");
+    }
+
+    console.log("token generated for user: ", record.userId);
+    const {accessToken, refreshToken} = await generateAccessAndRefreshTokens(record.userId);
+
+    const loggedInUser = await User.findById(record.userId).select("-password -refreshToken");
+
+    const options = {httpOnly: true, secure: true};
+
+    otpStore.delete(email); // Clear OTP after successful login
+    console.log("user logged in");
+
+    return res
+    .status(200)
+    .cookie("accessToken", accessToken, options)
+    .cookie("refreshToken", refreshToken, options)
+    .json(
+        new ApiResponse(
+            200,
+            {user: loggedInUser, accessToken, refreshToken},
+            "User logged in successfully"
+        )
+    );
+})
+
+
+
 
 const logoutUser = asyncHandler(async (req,res) => {
     await User.findByIdAndUpdate(req.user._id,
@@ -408,7 +513,9 @@ const getWatchHistory = asyncHandler(async (req,res) => {
 
 export {
     registerUser,
+    verifyRegistrationOtp,
     loginUser,
+    verifyLoginOtp,
     logoutUser,
     refreshAccessToken,
     changeCurrentPassword,
